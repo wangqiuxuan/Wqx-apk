@@ -18,9 +18,9 @@ jobs:
           docker run --rm \
             -v "$PWD":/workspace \
             -w /workspace \
-            -e BUILDOZER_WARN_ON_ROOT=0 \
+            --entrypoint /bin/bash \
             kivy/buildozer:latest \
-            android debug
+            -c "yes | buildozer android debug"
 
       - name: Fix permissions
         run: |
