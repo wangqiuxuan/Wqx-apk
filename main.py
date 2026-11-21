@@ -1,4 +1,5 @@
 import os
+import math
 import random
 import threading
 import ssl
@@ -12,7 +13,6 @@ from kivy.graphics import Color, Ellipse, RoundedRectangle
 from kivy.clock import Clock
 from kivy.metrics import dp
 from kivy.core.window import Window
-from kivy.animation import Animation
 from kivy.core.text import LabelBase
 
 # ================= 全局字体配置 =================
@@ -22,7 +22,6 @@ def load_font():
     global HAS_CN
     font_path = "chinese_font.ttf"
     
-    # 1. 尝试加载系统字体
     sys_fonts = [
         '/system/fonts/NotoSansCJK-Regular.ttc',
         '/system/fonts/DroidSansFallback.ttf',
@@ -37,7 +36,6 @@ def load_font():
             except Exception:
                 pass
                 
-    # 2. 如果本地有缓存字体，直接加载
     if os.path.exists(font_path):
         try:
             LabelBase.register(name='Roboto', fn_regular=font_path)
@@ -46,7 +44,6 @@ def load_font():
         except Exception:
             pass
 
-    # 3. 后台下载中文字体（不阻塞启动）
     def download():
         global HAS_CN
         url = "https://cdn.jsdelivr.net/gh/googlefonts/noto-cjk@main/Sans/SubsetOTF/SC/NotoSansSC-Regular.otf"
@@ -57,8 +54,12 @@ def load_font():
             if os.path.exists(font_path):
                 LabelBase.register(name='Roboto', fn_regular=font_path)
                 HAS_CN = True
-                # 下载成功后刷新界面
-                Clock.schedule_once(lambda dt: App.get_running_app().root.update_texts(), 0)
+                # 安全刷新界面
+                def safe_update(dt):
+                    app = App.get_running_app()
+                    if app and app.root:
+                        app.root.update_texts()
+                Clock.schedule_once(safe_update, 0)
         except Exception as e:
             print("字体下载失败:", e)
             
@@ -160,7 +161,11 @@ class DiceGame(BoxLayout):
         self.total = 0
         self.counts = {i: 0 for i in range(1, 7)}
         self.history = []
-        self._roll_event = None
+        
+        self._anim_timer = None
+        self._anim_time = 0
+        self._final_face = 1
+        self._orig_x = 0
 
         self.title_label = Label(font_size=dp(32), bold=True, size_hint_y=None, height=dp(60), color=(1, 1, 1, 1))
         self.add_widget(self.title_label)
@@ -199,31 +204,46 @@ class DiceGame(BoxLayout):
         self.roll_btn.disabled = True
         self.toast_label.text = ''
 
-        final = random_face()
-        orig_x = self.dice.x
+        self._final_face = random_face()
+        self._orig_x = self.dice.x
+        self._anim_time = 0
         
-        self._roll_event = Clock.schedule_interval(lambda dt: self.dice.show(random_face()), 0.05)
-        
-        # 骰子左右摇摆动画
-        anim = Animation(x=orig_x - dp(20), rotation=15, t='in_out_quad', duration=0.12) + \
-               Animation(x=orig_x + dp(20), rotation=-15, t='in_out_quad', duration=0.12)
-        anim.repeat = True
-        anim.start(self.dice)
+        # 使用 Clock 定时器进行安全动画，避免使用 Animation 库导致闪退
+        self._anim_timer = Clock.schedule_interval(self._update_animation, 1/60.0)
 
-        Clock.schedule_once(lambda dt: self._finish(final, orig_x), 1.2)
+    def _update_animation(self, dt):
+        if not self.rolling:
+            return False
 
-    def _finish(self, final, orig_x):
-        Clock.unschedule(self._roll_event)
-        self.dice.show(final)
+        self._anim_time += dt
         
-        # 回弹并定格动画
-        Animation.cancel_all(self.dice)
-        anim = Animation(x=orig_x, rotation=0, t='out_bounce', duration=0.4)
-        anim.start(self.dice)
-        
+        if self._anim_time < 1.0:
+            # 前1秒：高频切换点数，同时左右摇摆
+            if int(self._anim_time * 20) % 2 == 0:
+                self.dice.show(random_face())
+            
+            # 手动计算正弦偏移
+            offset = dp(15) * math.sin(self._anim_time * 30)
+            self.dice.x = self._orig_x + offset
+            
+        elif self._anim_time < 1.3:
+            # 1.0 到 1.3 秒：定格点数，回正位置（简单回弹效果）
+            self.dice.show(self._final_face)
+            progress = (self._anim_time - 1.0) / 0.3
+            # 使用缓动公式实现回弹效果
+            bounce = math.sin(progress * math.pi) * dp(10)
+            self.dice.x = self._orig_x + bounce
+        else:
+            # 动画结束
+            self.dice.x = self._orig_x
+            self._finish()
+            return False # 停止定时器
+
+    def _finish(self):
         self.rolling = False
         self.roll_btn.disabled = False
 
+        final = self._final_face
         self.total += 1
         self.counts[final] += 1
         self.history.insert(0, final)
@@ -231,9 +251,12 @@ class DiceGame(BoxLayout):
 
         if len(self.history) >= 3 and self.history[0] == self.history[1] == self.history[2]:
             self.toast_label.text = f'三连 {final}！欧气爆棚 🎉' if HAS_CN else f'TRIPLE {final}! 🎉'
-            Clock.schedule_once(lambda dt: setattr(self.toast_label, 'text', ''), 2.0)
+            Clock.schedule_once(self._clear_toast, 2.0)
 
         self.update_ui()
+
+    def _clear_toast(self, dt):
+        self.toast_label.text = ''
 
     def update_ui(self):
         if not HAS_CN:
@@ -248,9 +271,8 @@ class DiceGame(BoxLayout):
 
 class DiceApp(App):
     def build(self):
-        Window.clearcolor = (0.1, 0.11, 0.15, 1) # 深色背景
+        Window.clearcolor = (0.1, 0.11, 0.15, 1)
         self.root_widget = DiceGame()
-        Clock.schedule_once(lambda dt: self.root_widget.update_texts(), 0.5)
         return self.root_widget
 
 if __name__ == '__main__':
